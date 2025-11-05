@@ -28,6 +28,9 @@ services:
     environment:
       - DATABASE_URL=postgresql://admin:admin@db:5432/agendamento_db
       - BROKER_URL=amqp://guest:guest@broker:5672/
+      - BROKER_EXCHANGE=hospital.events
+      - BROKER_EXCHANGE_TYPE=topic
+      - SERVICE_NAME=scheduling-triage
     depends_on:
       - db
       - broker
