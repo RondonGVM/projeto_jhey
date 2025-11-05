@@ -1,16 +1,15 @@
 # api/main.py
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, current_app
 from sqlalchemy import text
 import os
 import click
-from datetime import datetime
-import pika
-import json
+from datetime import datetime, timezone
 
 from database import db
 from models import Room, Triage, Appointment
-from logger import log_event   #módulo de logging estruturado
+from logger import log_event   # módulo de logging estruturado
+from app.events import get_publisher
 
 
 # ==========================================================
@@ -26,38 +25,62 @@ app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
 
 db.init_app(app)
 
+# Inicializa o publisher do RabbitMQ na subida (declara exchange e testa conexão)
+try:
+    get_publisher()
+    app.logger.info("RabbitMQ publisher pronto.")
+except Exception as exc:
+    app.logger.error(f"Falha ao iniciar publisher RabbitMQ: {exc}")
+
 
 # ==========================================================
-# Publicação de Eventos no RabbitMQ
+# Publicação de Eventos via exchange 'hospital.events' (topic)
 # ==========================================================
-def publish_event(event_type, data):
-    """Publica um evento JSON no RabbitMQ e loga a ação."""
-    if not BROKER_URL:
-        log_event("rabbitmq_config_missing", {"BROKER_URL": None}, level="error")
-        return
+ROUTING_KEYS = {
+    # já existentes
+    "AppointmentBooked": "appointment.booked",
+    "AppointmentRescheduled": "appointment.rescheduled",
+    "TriageScoreAssigned": "triage.score_assigned",
+
+    # novos (mudança de status)
+    "AppointmentCheckedIn": "appointment.status.check_in",
+    "AppointmentCompleted": "appointment.status.completed",
+    "AppointmentCanceled": "appointment.status.canceled",
+    "AppointmentStatusChanged": "appointment.status.changed",
+}
+
+def publish_event(event_type: str, data: dict):
+    """
+    Publica evento no RabbitMQ via exchange 'hospital.events' (topic).
+    - event_type: pode ser uma das chaves do ROUTING_KEYS ou já uma routing key direta.
+    - data: dicionário com o corpo específico (appointment/triage).
+    """
+    routing_key = ROUTING_KEYS.get(event_type, event_type)
+
+    payload = {
+        "event": routing_key,
+        "version": 1,
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+    }
+    if routing_key.startswith("appointment.") and not routing_key.startswith("appointment.status"):
+        # eventos de agendamento (booked/rescheduled)
+        payload["appointment"] = data
+    elif routing_key.startswith("appointment.status"):
+        # eventos de status
+        payload["status_change"] = data
+    elif routing_key.startswith("triage."):
+        payload["triage"] = data
+    else:
+        payload["data"] = data  # fallback
 
     try:
-        connection = pika.BlockingConnection(pika.URLParameters(BROKER_URL))
-        channel = connection.channel()
-        channel.queue_declare(queue='events', durable=True)
-
-        payload = {
-            "event_type": event_type,
-            "data": data
-        }
-
-        channel.basic_publish(
-            exchange='',
-            routing_key='events',
-            body=json.dumps(payload),
-            properties=pika.BasicProperties(delivery_mode=2)
-        )
-
-        connection.close()
-        log_event("rabbitmq_event_published", {"event_type": event_type, "data": data})
-
+        publisher = get_publisher()
+        event_id = publisher.publish(routing_key, payload)
+        log_event("rabbitmq_event_published", {"routing_key": routing_key, "event_id": event_id})
+        return event_id
     except Exception as e:
-        log_event("rabbitmq_publish_failed", {"erro": str(e)}, level="error")
+        log_event("rabbitmq_publish_failed", {"routing_key": routing_key, "erro": str(e)}, level="error")
+        return None
 
 
 # ==========================================================
@@ -92,7 +115,7 @@ def create_room():
     """Cria uma nova sala no banco de dados."""
     data = request.json
 
-    if not data or not 'room_name' in data or not 'room_type' in data:
+    if not data or 'room_name' not in data or 'room_type' not in data:
         log_event("room_create_failed", {"motivo": "dados incompletos"}, level="error")
         return jsonify({"erro": "Dados incompletos"}), 400
 
@@ -160,10 +183,13 @@ def create_appointment():
     db.session.commit()
 
     publish_event("AppointmentBooked", {
-        "appointment_id": new_appointment.id,
+        "id": new_appointment.id,
         "patient_id": new_appointment.patient_id,
+        "staff_id": new_appointment.staff_id,
         "room_id": new_appointment.room_id,
-        "start_time": data['start_time']
+        "scheduled_at": new_appointment.start_time.isoformat(),
+        "end_at": new_appointment.end_time.isoformat(),
+        "status": new_appointment.status,
     })
 
     log_event("appointment_created", {
@@ -226,19 +252,38 @@ def list_appointments():
 
 @app.route('/appointments/<int:appointment_id>', methods=['PUT'])
 def update_appointment(appointment_id):
-    """Atualiza o status ou horário de um agendamento."""
+    """Atualiza o status ou horário de um agendamento e publica eventos adequados."""
     appointment = Appointment.query.get(appointment_id)
     if not appointment:
         log_event("appointment_update_failed", {"motivo": "não encontrado", "id": appointment_id}, level="error")
         return jsonify({"erro": "Agendamento não encontrado"}), 404
 
-    data = request.json
+    data = request.json or {}
     updated = False
 
-    if 'status' in data:
-        appointment.status = data['status']
-        updated = True
+    # Capturar estado anterior para detecção de mudança
+    old_status = appointment.status
+    status_changed = False
+    time_changed = False
 
+    # Validação/atualização de status
+    if 'status' in data:
+        novo_status = data['status']
+        allowed = {"agendado", "check-in", "finalizado", "cancelado"}
+        if novo_status not in allowed:
+            log_event("appointment_update_failed", {
+                "motivo": "status inválido",
+                "recebido": novo_status,
+                "permitidos": sorted(list(allowed))
+            }, level="error")
+            return jsonify({"erro": "status inválido", "permitidos": sorted(list(allowed))}), 400
+
+        if novo_status != appointment.status:
+            appointment.status = novo_status
+            status_changed = True
+            updated = True
+
+    # Validação/atualização de horário (aqui mantém a regra atual: só troca se vier start e end juntos)
     if 'start_time' in data and 'end_time' in data:
         try:
             new_start = datetime.fromisoformat(data['start_time'])
@@ -258,25 +303,73 @@ def update_appointment(appointment_id):
             log_event("appointment_conflict_update", {"id": appointment_id}, level="error")
             return jsonify({"erro": "Conflito de horário com outro agendamento"}), 409
 
-        appointment.start_time = new_start
-        appointment.end_time = new_end
-        updated = True
+        if new_start != appointment.start_time or new_end != appointment.end_time:
+            appointment.start_time = new_start
+            appointment.end_time = new_end
+            time_changed = True
+            updated = True
 
     if not updated:
         log_event("appointment_update_skipped", {"id": appointment_id})
         return jsonify({"erro": "Nada para atualizar"}), 400
 
+    # Commit primeiro, eventos depois
     db.session.commit()
 
-    publish_event("AppointmentRescheduled", {
+    # 1) Se só mudou horário (e não status), publica reschedule
+    if time_changed and not status_changed:
+        publish_event("AppointmentRescheduled", {
+            "id": appointment.id,
+            "status": appointment.status,
+            "scheduled_at": appointment.start_time.isoformat(),
+            "end_at": appointment.end_time.isoformat(),
+        })
+
+    # 2) Se mudou status, publica específicos + genérico
+    if status_changed:
+        new_status = appointment.status
+
+        # Específico por status
+        if new_status == "check-in":
+            publish_event("AppointmentCheckedIn", {
+                "appointment_id": appointment.id,
+                "old_status": old_status,
+                "new_status": new_status
+            })
+        elif new_status == "finalizado":
+            publish_event("AppointmentCompleted", {
+                "appointment_id": appointment.id,
+                "old_status": old_status,
+                "new_status": new_status
+            })
+        elif new_status == "cancelado":
+            publish_event("AppointmentCanceled", {
+                "appointment_id": appointment.id,
+                "old_status": old_status,
+                "new_status": new_status
+            })
+        # "agendado" normalmente não dispara específico (voltar ao agendado). Mantemos só o genérico.
+
+        # Genérico - sempre que o status muda
+        publish_event("AppointmentStatusChanged", {
+            "appointment_id": appointment.id,
+            "old_status": old_status,
+            "new_status": new_status
+        })
+
+    log_event("appointment_updated", {
         "appointment_id": appointment.id,
+        "status": appointment.status,
+        "time_changed": time_changed,
+        "status_changed": status_changed
+    })
+
+    return jsonify({
+        "id": appointment.id,
         "status": appointment.status,
         "start_time": appointment.start_time.isoformat(),
         "end_time": appointment.end_time.isoformat()
-    })
-
-    log_event("appointment_updated", {"appointment_id": appointment.id, "status": appointment.status})
-    return jsonify({"mensagem": "Agendamento atualizado com sucesso"}), 200
+    }), 200
 
 
 # ==========================================================
