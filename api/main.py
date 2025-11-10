@@ -373,6 +373,195 @@ def update_appointment(appointment_id):
 
 
 # ==========================================================
+# ENDPOINTS DE /triage
+# ==========================================================
+@app.route('/triage', methods=['POST'])
+def create_triage():
+    """
+    Cria uma nova triagem aplicando o Protocolo de Manchester.
+    Espera: patient_id, symptoms (lista), appointment_id (opcional)
+    """
+    data = request.json
+    
+    if not data or 'patient_id' not in data or 'symptoms' not in data:
+        log_event("triage_create_failed", {"motivo": "dados incompletos"}, level="error")
+        return jsonify({"erro": "Campos obrigatórios ausentes (patient_id, symptoms)"}), 400
+    
+    patient_id = data['patient_id']
+    symptoms = data.get('symptoms', [])
+    appointment_id = data.get('appointment_id')
+    
+    # Aplicar lógica do Protocolo de Manchester
+    manchester_score = calculate_manchester_score(symptoms)
+    
+    # Criar registro de triagem
+    new_triage = Triage(
+        patient_id=patient_id,
+        manchester_score=manchester_score,
+        appointment_id=appointment_id
+    )
+    
+    db.session.add(new_triage)
+    db.session.commit()
+    
+    # Publicar evento de triagem realizada
+    publish_event("TriageScoreAssigned", {
+        "id": new_triage.id,
+        "patient_id": new_triage.patient_id,
+        "manchester_level": new_triage.manchester_score,
+        "symptoms": symptoms,
+        "assigned_at": new_triage.timestamp.isoformat(),
+        "appointment_id": appointment_id
+    })
+    
+    log_event("triage_created", {
+        "triage_id": new_triage.id,
+        "patient_id": new_triage.patient_id,
+        "manchester_score": new_triage.manchester_score,
+        "symptoms": symptoms
+    })
+    
+    return jsonify({
+        "id": new_triage.id,
+        "patient_id": new_triage.patient_id,
+        "manchester_score": new_triage.manchester_score,
+        "priority": get_priority_name(manchester_score),
+        "timestamp": new_triage.timestamp.isoformat()
+    }), 201
+
+
+@app.route('/triage', methods=['GET'])
+def list_triages():
+    """Lista triagens com filtros opcionais por paciente ou appointment."""
+    query = Triage.query
+    
+    patient_id = request.args.get('patient_id')
+    appointment_id = request.args.get('appointment_id')
+    
+    if patient_id:
+        query = query.filter_by(patient_id=patient_id)
+    if appointment_id:
+        query = query.filter_by(appointment_id=appointment_id)
+    
+    # Ordenar do mais recente para o mais antigo
+    triages = query.order_by(Triage.timestamp.desc()).all()
+    
+    result = [
+        {
+            "id": t.id,
+            "patient_id": t.patient_id,
+            "manchester_score": t.manchester_score,
+            "priority": get_priority_name(t.manchester_score),
+            "timestamp": t.timestamp.isoformat(),
+            "appointment_id": t.appointment_id
+        }
+        for t in triages
+    ]
+    
+    log_event("triages_listed", {"total": len(result)})
+    return jsonify(result), 200
+
+
+@app.route('/triage/<int:triage_id>', methods=['GET'])
+def get_triage(triage_id):
+    """Retorna os detalhes de uma triagem específica."""
+    triage = Triage.query.get(triage_id)
+    
+    if not triage:
+        log_event("triage_get_failed", {"motivo": "não encontrada", "id": triage_id}, level="error")
+        return jsonify({"erro": "Triagem não encontrada"}), 404
+    
+    log_event("triage_retrieved", {"triage_id": triage_id})
+    
+    return jsonify({
+        "id": triage.id,
+        "patient_id": triage.patient_id,
+        "manchester_score": triage.manchester_score,
+        "priority": get_priority_name(triage.manchester_score),
+        "timestamp": triage.timestamp.isoformat(),
+        "appointment_id": triage.appointment_id
+    }), 200
+
+
+# ==========================================================
+# FUNÇÕES AUXILIARES - PROTOCOLO DE MANCHESTER
+# ==========================================================
+def calculate_manchester_score(symptoms):
+    """
+    Aplica lógica simplificada do Protocolo de Manchester.
+    Retorna um score de 1 (emergência) a 5 (não urgente).
+    
+    Níveis:
+    1 - EMERGENTE (vermelho): risco imediato de vida
+    2 - MUITO URGENTE (laranja): risco de vida potencial
+    3 - URGENTE (amarelo): condições que podem piorar
+    4 - POUCO URGENTE (verde): problemas menos graves
+    5 - NÃO URGENTE (azul): condições crônicas ou menores
+    """
+    if not symptoms or len(symptoms) == 0:
+        return 5  # Sem sintomas = não urgente
+    
+    symptoms_lower = [s.lower() for s in symptoms]
+    
+    # Palavras-chave para cada nível de prioridade
+    emergency_keywords = [
+        'parada', 'cardíaca', 'respiratória', 'inconsciência', 'inconsciente',
+        'convulsão', 'hemorragia', 'severa', 'choque', 'trauma', 'grave'
+    ]
+    
+    very_urgent_keywords = [
+        'dor no peito', 'falta de ar', 'dificuldade respirar', 'confusão mental',
+        'alteração consciência', 'sangramento', 'fratura exposta', 'queimadura grave'
+    ]
+    
+    urgent_keywords = [
+        'febre alta', 'dor intensa', 'vômito', 'diarreia', 'desidratação',
+        'tontura', 'fratura', 'luxação', 'corte profundo'
+    ]
+    
+    less_urgent_keywords = [
+        'dor moderada', 'febre', 'tosse', 'resfriado', 'dor de garganta',
+        'náusea', 'dor de ouvido', 'pequeno corte'
+    ]
+    
+    # Verificar por palavras-chave (da mais grave para menos grave)
+    for symptom in symptoms_lower:
+        # Nível 1 - EMERGENTE
+        if any(keyword in symptom for keyword in emergency_keywords):
+            return 1
+    
+    for symptom in symptoms_lower:
+        # Nível 2 - MUITO URGENTE
+        if any(keyword in symptom for keyword in very_urgent_keywords):
+            return 2
+    
+    for symptom in symptoms_lower:
+        # Nível 3 - URGENTE
+        if any(keyword in symptom for keyword in urgent_keywords):
+            return 3
+    
+    for symptom in symptoms_lower:
+        # Nível 4 - POUCO URGENTE
+        if any(keyword in symptom for keyword in less_urgent_keywords):
+            return 4
+    
+    # Nível 5 - NÃO URGENTE (default)
+    return 5
+
+
+def get_priority_name(score):
+    """Retorna o nome da prioridade baseado no score de Manchester."""
+    priority_map = {
+        1: "Emergente (Vermelho)",
+        2: "Muito Urgente (Laranja)",
+        3: "Urgente (Amarelo)",
+        4: "Pouco Urgente (Verde)",
+        5: "Não Urgente (Azul)"
+    }
+    return priority_map.get(score, "Desconhecido")
+
+
+# ==========================================================
 # CLI para inicializar o banco
 # ==========================================================
 @app.cli.command('init-db')
